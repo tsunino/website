@@ -1,0 +1,674 @@
+# -*- coding: utf-8 -*-
+"""
+DASHBOARD BI - UTS BUSINESS INTELLIGENCE (P8) - TIF46212
+Integrasi Data Mining & BI pada Data Transaksi Toko (EDA, Preprocessing, Apriori, K-Means, Dashboard)
+
+Cara menjalankan:
+    pip install flask pandas numpy scikit-learn openpyxl
+    python dashboard_uts_bi_p8.py
+    buka http://127.0.0.1:5000
+Login: username  febriana  |  kata sandi  51230136
+Foto cover: taruh file foto.jpg / foto.png di folder yang sama, atau unggah di halaman login.
+Alur: Cover/Login -> Upload file Excel (P8__UTS_Business_Intelligence.xlsx) -> Dashboard.
+Analisis TIDAK berjalan sebelum file diunggah; semua angka dihitung dari isi sheet Data_Raw.
+"""
+import os, io, json, glob, itertools
+import numpy as np
+import pandas as pd
+from flask import Flask, request, session, redirect, Response, send_file
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import silhouette_score
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+NAMA, NPM, UNIV = "Febriana Tsunino", "51230136", "Universitas Timor"
+MATKUL, KODE, SEM, PRODI = "Business Intelligence", "TIF46212", "VII (Tujuh)", "Teknologi Informasi"
+DOSEN = "Krisantus Jumarto Tey Seran, S.T., M.T."
+USER, PWD = "febriana", "51230136"
+REQ = ['Transaction_ID', 'Transaction_Date', 'Customer_ID', 'Region', 'Customer_Type', 'Product_ID', 'Product_Name',
+       'Category', 'Quantity', 'Unit_Price', 'Discount_Rate', 'Line_Total', 'Payment_Method']
+MS_DEF, MC_DEF, K_DEF = 0.01, 0.15, 3
+
+app = Flask(__name__)
+app.secret_key = "unimor-bi-uts-p8"
+app.config['MAX_CONTENT_LENGTH'] = 60 * 1024 * 1024
+S = {}  # state analisis (aplikasi lokal satu pengguna)
+
+
+# ------------------------------------------------------------------ util
+def cj(o):
+    if isinstance(o, dict): return {str(k): cj(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)): return [cj(v) for v in o]
+    if isinstance(o, np.bool_): return bool(o)
+    if isinstance(o, np.integer): return int(o)
+    if isinstance(o, (float, np.floating)): return None if (np.isnan(o) or np.isinf(o)) else float(o)
+    if isinstance(o, pd.Timestamp): return str(o)[:10]
+    if o is pd.NA: return None
+    return o
+
+
+def api(o): return Response(json.dumps(cj(o), ensure_ascii=False), mimetype='application/json')
+
+
+def foto_file():
+    for p in ('foto*', 'Foto*', 'foto_profil*'):
+        for f in glob.glob(os.path.join(BASE, p)):
+            if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')): return f
+    return None
+
+
+def n_incons(s):
+    k = s.dropna().astype(str)
+    key = k.str.strip().str.lower()
+    canon = k.groupby(key).agg(lambda x: x.value_counts().index[0])
+    return int((k != key.map(canon)).sum()), canon
+
+
+# ------------------------------------------------------------------ load & audit
+def load(f):
+    xl = pd.ExcelFile(f)
+    nm = {s.strip().lower(): s for s in xl.sheet_names}
+    if 'data_raw' not in nm: raise ValueError("Sheet 'Data_Raw' tidak ditemukan. Unggah file P8 UTS Business Intelligence.")
+    raw = xl.parse(nm['data_raw'])
+    miss = [c for c in REQ if c not in raw.columns]
+    if miss: raise ValueError("Kolom tidak lengkap di Data_Raw: " + ", ".join(miss))
+    if 'data_produk' in nm:
+        prod = xl.parse(nm['data_produk'])
+    else:
+        v = raw.dropna(subset=['Product_ID', 'Product_Name'])
+        prod = v.groupby('Product_ID').agg(Product_Name=('Product_Name', lambda s: s.mode()[0]),
+                                           Category=('Category', lambda s: s.str.strip().str.title().mode()[0]),
+                                           Reference_Unit_Price_Rp=('Unit_Price', lambda s: s[s > 0].mode()[0])).reset_index()
+    cust = xl.parse(nm['data_pelanggan']) if 'data_pelanggan' in nm else None
+    return raw, prod, cust
+
+
+def audit(raw, prod):
+    dt = pd.to_datetime(raw.Transaction_Date, errors='coerce')
+    rp = raw.Product_Name.map(prod.drop_duplicates('Product_Name').set_index('Product_Name').Reference_Unit_Price_Rp)
+    q, p = raw.Quantity, raw.Unit_Price
+    calc = q * p * (1 - raw.Discount_Rate)
+    ic, _ = n_incons(raw.Category)
+    ip, _ = n_incons(raw.Payment_Method)
+    a = dict(rows=len(raw), cols=raw.shape[1],
+             dtypes=[[c, str(raw[c].dtype), int(raw[c].isna().sum())] for c in raw.columns],
+             date_min=str(dt.min())[:10], date_max=str(dt.max())[:10],
+             n_txn=raw.Transaction_ID.nunique(), n_cust=raw.Customer_ID.nunique(), n_prod=raw.Product_Name.nunique(),
+             sales=float(raw.Line_Total.sum()), avg_qty=float(q[(q > 0) & (q <= 50)].mean()),
+             missing=int(raw.isna().sum().sum()), dups=int(raw.duplicated().sum()),
+             bad_qty=int(((q <= 0) | (q > 50)).sum()), bad_price=int(((p <= 0) | (p > 3 * rp)).sum()),
+             bad_lt=int(((calc - raw.Line_Total).abs() > 1).sum()), inc_cat=ic, inc_pay=ip)
+    m = raw.assign(M=dt.dt.strftime('%Y-%m')).groupby('M').Line_Total.sum()
+    tp = raw.groupby('Product_Name').Line_Total.sum().nlargest(10)
+    qv = q.dropna()
+    lab = pd.Series(np.where(qv <= 0, '≤0', np.where(qv > 6, '>6 (ekstrem)', qv.round().astype(int).astype(str))))
+    order = ['≤0', '1', '2', '3', '4', '5', '6', '>6 (ekstrem)']
+    qd = lab.value_counts().reindex(order).fillna(0)
+    a['charts'] = dict(monthly=[list(m.index), list(m.values)], top=[list(tp.index), list(tp.values)],
+                       qty=[list(qd.index), list(qd.values)],
+                       miss=[[c for c in raw.columns if raw[c].isna().sum() > 0], [int(raw[c].isna().sum()) for c in raw.columns if raw[c].isna().sum() > 0]])
+    pm = raw.Payment_Method.dropna().str.strip().str.title().replace({'Qris': 'QRIS'}).value_counts()
+    a['insights'] = [
+        f"Penjualan mentah mencapai Rp {a['sales']:,.0f} dari {a['n_txn']:,} transaksi unik; bulan tertinggi {m.idxmax()} (Rp {m.max():,.0f}), terendah {m.idxmin()}.".replace(',', '.'),
+        f"Produk dengan penjualan tertinggi: {tp.index[0]} (Rp {tp.iloc[0]:,.0f}), disusul {tp.index[1]} dan {tp.index[2]}.".replace(',', '.'),
+        f"Kualitas data bermasalah: {a['dups']} baris duplikat, {a['missing']} sel kosong, {a['bad_qty']} Quantity tidak valid, {a['bad_price']} Unit_Price tidak wajar, {a['inc_cat'] + a['inc_pay']} ejaan kategori/pembayaran tidak konsisten.",
+        f"Satu transaksi rata-rata berisi {a['rows'] / a['n_txn']:.2f} baris produk, sehingga jumlah transaksi harus dihitung dari Transaction_ID unik (bukan jumlah baris).",
+        f"Metode pembayaran terbanyak: {pm.index[0]} ({pm.iloc[0] / pm.sum() * 100:.1f}%) - sebarannya hampir merata antar metode.",
+    ]
+    return a
+
+
+# ------------------------------------------------------------------ preprocessing
+def summ(df, sales_col):
+    q, p = df.Quantity, df.Unit_Price
+    return dict(rows=len(df), n_txn=df.Transaction_ID.nunique(), n_cust=df.Customer_ID.nunique(), n_prod=df.Product_Name.nunique(),
+                missing=int(df.isna().sum().sum()), dups=int(df.duplicated().sum()),
+                bad_qty=int(((q <= 0) | (q > 50)).sum()), bad_price=int(((p <= 0) | (p > 100000)).sum()),
+                sales=float(df[sales_col].sum()))
+
+
+def preprocess(raw, prod, cust):
+    log = []
+
+    def L(m, n, k, a): log.append(dict(masalah=m, jumlah=int(n), keputusan=k, alasan=a))
+    before = summ(raw, 'Line_Total')
+    df = raw.copy()
+    n = df.duplicated().sum(); df = df.drop_duplicates()
+    L("Baris duplikat persis", n, "Dihapus (simpan 1)", "Duplikat menggandakan penjualan & jumlah item pada basket.")
+    for c in df.columns:
+        if df[c].dtype == object or pd.api.types.is_string_dtype(df[c]): df[c] = df[c].str.strip()
+    df['Transaction_Date'] = pd.to_datetime(df['Transaction_Date'], errors='coerce')
+    n = len(df); df = df.dropna(subset=['Transaction_Date', 'Transaction_ID'])
+    L("Tanggal/ID transaksi tidak valid", n - len(df), "Dihapus", "Tanpa tanggal/ID, baris tidak dapat dipakai untuk tren, Recency maupun basket.")
+    pk = prod.drop_duplicates('Product_ID').set_index('Product_ID')
+    m = df.Product_ID.isna()
+    df.loc[m, 'Product_ID'] = df.loc[m, 'Product_Name'].map(prod.drop_duplicates('Product_Name').set_index('Product_Name').Product_ID)
+    L("Product_ID kosong", m.sum(), "Diimputasi dari Product_Name via katalog Data_Produk", "Nama produk lengkap & 1:1 dengan ID, sehingga imputasi pasti.")
+    n = len(df); df = df[df.Product_ID.isin(pk.index)].copy()
+    L("Produk tidak ada di katalog", n - len(df), "Dihapus", "Tidak dapat dipetakan ke produk resmi.")
+    df['Product_Name'] = df.Product_ID.map(pk.Product_Name)
+    ci = (df.Category != df.Product_ID.map(pk.Category)).sum()
+    df['Category'] = df.Product_ID.map(pk.Category)
+    L("Kategori tidak konsisten (huruf besar/kecil, spasi)", ci, "Diseragamkan mengikuti katalog", "Kategori tunggal per produk agar agregasi per kategori tidak terpecah.")
+    first = df.groupby('Transaction_ID').Customer_ID.transform('first')
+    m = df.Customer_ID.isna(); df.loc[m, 'Customer_ID'] = first[m]
+    L("Customer_ID kosong", m.sum(), "Diisi dari baris lain pada Transaction_ID yang sama", "Satu nota hanya milik satu pelanggan.")
+    n = len(df); df = df.dropna(subset=['Customer_ID']).copy()
+    L("Customer_ID tetap kosong", n - len(df), "Dihapus", "RFM/K-Means membutuhkan identitas pelanggan.")
+    cm = cust.drop_duplicates('Customer_ID').set_index('Customer_ID') if cust is not None else None
+    tot = 0
+    for c in ['Region', 'Customer_Type']:
+        m = df[c].isna(); tot += m.sum()
+        if cm is not None: df.loc[m, c] = df.Customer_ID.map(cm[c])[m]
+        df[c] = df[c].fillna('Tidak Diketahui')
+    L("Region/Customer_Type kosong", tot, "Diisi dari Data_Pelanggan; sisanya 'Tidak Diketahui'", "Atribut pelanggan bersifat tetap, jadi dapat dipulihkan dari master.")
+    ref = df.Product_ID.map(pk.Reference_Unit_Price_Rp)
+    bad = df.Unit_Price.isna() | (df.Unit_Price <= 0) | (df.Unit_Price > 3 * ref)
+    df.loc[bad, 'Unit_Price'] = ref[bad]
+    L("Unit_Price kosong/negatif/ekstrem (mis. 999.999)", bad.sum(), "Diganti harga referensi katalog", "Harga valid pada data selalu sama dengan harga referensi produk.")
+    q = df.Quantity
+    bad = q.isna() | (q <= 0) | (q > 50)
+    rec = (df.Line_Total / (df.Unit_Price * (1 - df.Discount_Rate))).round()
+    okr = bad & df.Line_Total.notna() & rec.between(1, 20)
+    df.loc[okr, 'Quantity'] = rec[okr]
+    med = df.loc[~bad, 'Quantity'].median()
+    rest = bad & ~okr; df.loc[rest, 'Quantity'] = med
+    L("Quantity kosong/nol/negatif/ekstrem (mis. 999)", bad.sum(), f"{okr.sum()} dipulihkan dari Line_Total÷(harga×(1−diskon)); {rest.sum()} diisi median ({med:.0f})", "Retail eceran tidak mungkin 999 unit/baris; nilai kuantitas dipulihkan dari total yang valid agar konteks bisnis terjaga.")
+    calc = (df.Quantity * df.Unit_Price * (1 - df.Discount_Rate)).round()
+    nlt = (df.Line_Total.isna() | ((df.Line_Total - calc).abs() > 1)).sum()
+    df['Net_Sales'] = calc
+    L("Line_Total kosong/tidak konsisten", nlt, "Dihitung ulang: Quantity × Unit_Price × (1 − Discount_Rate) → Net_Sales", "Rumus pada Data_Dictionary; menjamin konsistensi penjualan bersih.")
+    ip, canon = n_incons(df.Payment_Method)
+    key = df.Payment_Method.str.lower()
+    df['Payment_Method'] = key.map(canon).fillna('Tidak Diketahui')
+    L("Payment_Method tidak konsisten/kosong", ip + raw.Payment_Method.isna().sum(), "Ejaan diseragamkan; kosong → 'Tidak Diketahui'", "Nilai kosong tidak boleh ditebak; kategori khusus menjaga baris tetap dipakai.")
+    n = len(df); df = df.drop_duplicates(['Transaction_ID', 'Product_ID'])
+    L("Produk ganda dalam satu transaksi (setelah dibersihkan)", n - len(df), "Dihapus (simpan baris pertama)", "Basket Apriori berisi produk unik per transaksi.")
+    df = df.drop(columns=['Line_Total'])
+    df['Date'] = df.Transaction_Date.dt.normalize()
+    df['Month'] = df.Date.dt.strftime('%Y-%m')
+    df = df.reset_index(drop=True)
+    return df, log, dict(before=before, after=summ(df, 'Net_Sales'))
+
+
+def build(c):
+    tx = c.groupby('Transaction_ID').agg(Date=('Date', 'first'), Customer_ID=('Customer_ID', 'first'), Net_Sales=('Net_Sales', 'sum'),
+                                         basket_size=('Product_ID', 'nunique'), Qty=('Quantity', 'sum')).reset_index()
+    ref = c.Date.max() + pd.Timedelta(days=1)
+    rfm = tx.groupby('Customer_ID').agg(Recency=('Date', lambda s: (ref - s.max()).days), Frequency=('Transaction_ID', 'nunique'),
+                                        Monetary=('Net_Sales', 'sum')).reset_index()
+    return tx, rfm, ref
+
+
+# ------------------------------------------------------------------ K-Means
+STRAT = {
+    'Loyal Customers': "Program loyalitas & poin, akses awal produk baru, bundling premium; jaga kepuasan agar tidak pindah toko.",
+    'Churn Risk': "Kampanye win-back (voucher terbatas waktu, pesan personal 'kami rindu Anda'), survei singkat penyebab berhenti belanja.",
+    'At Risk (Bernilai Tinggi)': "Prioritas tinggi: hubungi personal, tawaran khusus produk favorit sebelum pelanggan benar-benar hilang.",
+    'New Customers': "Sambut dengan voucher belanja kedua, rekomendasi produk pelengkap (cross-selling) untuk membentuk kebiasaan.",
+    'Potential Customers': "Dorong frekuensi: promo bundling dari aturan Apriori, diskon kelipatan belanja, pengingat restock berkala."}
+
+
+def seg_label(zr, zf, zm):
+    if zf > 0.3 and zm > 0.3 and zr < 0.3: return 'Loyal Customers'
+    if zr > 0.5 and zf <= 0.3: return 'Churn Risk'
+    if zr > 0.5: return 'At Risk (Bernilai Tinggi)'
+    if zr < 0 and zf < 0 and zm < 0: return 'Potential Customers'
+    return 'Potential Customers'
+
+
+def km_eval(rfm):
+    Z = StandardScaler().fit_transform(rfm[['Recency', 'Frequency', 'Monetary']])
+    ev = []
+    for k in range(2, 9):
+        km = KMeans(k, n_init=10, random_state=42).fit(Z)
+        ev.append(dict(k=k, inertia=float(km.inertia_), sil=float(silhouette_score(Z, km.labels_))))
+    return Z, ev
+
+
+def km_fit(k):
+    rfm, Z = S['rfm'], S['Z']
+    km = KMeans(k, n_init=10, random_state=42).fit(Z)
+    r = rfm.copy(); r['cl'] = km.labels_
+    g = r.groupby('cl').agg(n=('Customer_ID', 'size'), R=('Recency', 'mean'), F=('Frequency', 'mean'), M=('Monetary', 'mean'),
+                            Rm=('Recency', 'median'), Fm=('Frequency', 'median'), Mm=('Monetary', 'median')).sort_values('M', ascending=False)
+    labs, used = {}, {}
+    for cl, row in g.iterrows():
+        zr = (row.R - rfm.Recency.mean()) / rfm.Recency.std(); zf = (row.F - rfm.Frequency.mean()) / rfm.Frequency.std()
+        zm = (row.M - rfm.Monetary.mean()) / rfm.Monetary.std()
+        lb = seg_label(zr, zf, zm); used[lb] = used.get(lb, 0) + 1
+        labs[cl] = lb if used[lb] == 1 else f"{lb} ({used[lb]})"
+    r['Segmen'] = r.cl.map(labs)
+    S['seg'] = r.set_index('Customer_ID').Segmen
+    S['k'] = k
+    prof = [dict(segmen=labs[cl], cluster=int(cl) + 1, n=int(x.n), pct=float(x.n / len(r) * 100), R=x.R, F=x.F, M=x.M, Rm=x.Rm, Fm=x.Fm, Mm=x.Mm,
+                 strategi=STRAT.get(labs[cl].split(' (')[0] if labs[cl] not in STRAT else labs[cl], STRAT['Potential Customers'])) for cl, x in g.iterrows()]
+    order = [p['segmen'] for p in prof]
+    pts = [[int(a), int(b), float(c), order.index(s)] for a, b, c, s in zip(r.Recency, r.Frequency, r.Monetary, r.Segmen)]
+    S['prof'] = prof
+    return dict(k=k, eval=S['ev'], profil=prof, points=pts, order=order)
+
+
+# ------------------------------------------------------------------ Apriori
+def apriori(B, items, ms, max_len=3):
+    n = B.shape[0]
+    sup = B.mean(0)
+    freq = {(i,): float(sup[i]) for i in range(len(items)) if sup[i] >= ms}
+    allf, cur, k = dict(freq), sorted(freq), 2
+    while cur and k <= max_len:
+        cs, cand = set(cur), set()
+        for a in cur:
+            for b in cur:
+                if a[:-1] == b[:-1] and a[-1] < b[-1]:
+                    c = a + (b[-1],)
+                    if all(s in cs for s in itertools.combinations(c, k - 1)): cand.add(c)
+        nxt = {}
+        for c in cand:
+            s = float(B[:, list(c)].all(1).mean())
+            if s >= ms: nxt[c] = s
+        allf.update(nxt); cur = sorted(nxt); k += 1
+    return allf
+
+
+def run_apriori(c, ms, mc, top=10):
+    if c.empty: return dict(ok=False, msg="Tidak ada data pada filter ini.")
+    Bd = pd.crosstab(c.Transaction_ID, c.Product_Name).clip(upper=1).astype(bool)
+    items, B = list(Bd.columns), Bd.values
+    allf = apriori(B, items, ms)
+    rules = []
+    for its, s in allf.items():
+        if len(its) < 2: continue
+        for r in range(1, len(its)):
+            for a in itertools.combinations(its, r):
+                cons = tuple(x for x in its if x not in a)
+                conf = s / allf[a]; lift = conf / allf[cons]
+                if conf >= mc: rules.append(dict(a=" + ".join(items[i] for i in a), c=" + ".join(items[i] for i in cons), support=s, confidence=conf, lift=lift, size=len(its)))
+    rules.sort(key=lambda r: (-r['lift'], -r['confidence'], -r['support']))
+    good = [r for r in rules if r['lift'] > 1]
+    sz = {}
+    for its in allf: sz[len(its)] = sz.get(len(its), 0) + 1
+    sup = B.mean(0); ti = np.argsort(-sup)[:12]
+    heat = [[float((B[:, i] & B[:, j]).mean() / (sup[i] * sup[j])) if i != j else None for j in ti] for i in ti]
+    return dict(ok=True, n_txn=int(B.shape[0]), n_items=len(items), ms=ms, mc=mc, sizes=sz, n_rules=len(rules), n_good=len(good),
+                rules=good[:top], heat=dict(items=[items[i] for i in ti], m=heat))
+
+
+# ------------------------------------------------------------------ filter
+def filt(a):
+    c = S['clean']
+    if a.get('start'): c = c[c.Date >= pd.Timestamp(a['start'])]
+    if a.get('end'): c = c[c.Date <= pd.Timestamp(a['end'])]
+    cats = [x for x in a.get('cats', '').split('|') if x]
+    if cats: c = c[c.Category.isin(cats)]
+    seg = a.get('seg', 'Semua')
+    if seg and seg != 'Semua': c = c[c.Customer_ID.isin(S['seg'][S['seg'] == seg].index)]
+    return c
+
+
+# ------------------------------------------------------------------ rekomendasi & BU
+def rp(x): return "Rp " + f"{x:,.0f}".replace(',', '.')
+
+
+def rekom():
+    c, tx = S['clean'], S['tx']
+    ap = run_apriori(c, MS_DEF, MC_DEF, 5)
+    price = c.groupby('Product_Name').Net_Sales.sum() / c.groupby('Product_Name').Quantity.sum()
+    prof = S['prof']
+    churn = next((p for p in prof if 'Churn' in p['segmen'] or 'At Risk' in p['segmen']), max(prof, key=lambda p: p['R']))
+    loyal = next((p for p in prof if 'Loyal' in p['segmen']), max(prof, key=lambda p: p['M']))
+    pot = next((p for p in prof if 'Potential' in p['segmen'] or 'New' in p['segmen']), prof[-1])
+    R = []
+    tr = ap['rules'][:3]
+    if tr:
+        extra = 0
+        for r in tr:
+            na = r['support'] / r['confidence'] * ap['n_txn']; nwo = na - r['support'] * ap['n_txn']
+            extra += nwo * 0.05 * sum(price.get(x, 0) for x in r['c'].split(' + '))
+        R.append(dict(judul="Bundling & penempatan berdekatan untuk pasangan produk teratas", skor=[5, 4, 4, 5],
+                      bukti="Fakta data: " + "; ".join(f"{r['a']} → {r['c']} (support {r['support'] * 100:.2f}%, confidence {r['confidence'] * 100:.1f}%, lift {r['lift']:.2f})" for r in tr) + ". Aturan asosiasi menunjukkan keterkaitan, bukan sebab-akibat.",
+                      tindakan="Letakkan tiap pasangan berdampingan di rak/etalase, buat paket bundling dengan diskon kecil, dan tawarkan produk pasangan di kasir.",
+                      kpi="Attach rate pasangan, rata-rata basket_size, rata-rata nilai transaksi.",
+                      estimasi=f"Estimasi (asumsi): bila 5% transaksi yang membeli produk pertama tanpa produk pasangan menerima tawaran, tambahan penjualan ≈ {rp(extra)} per tahun (sebelum biaya diskon).",
+                      asumsi="Tingkat penerimaan 5%, harga satuan rata-rata historis, tidak ada kanibalisasi produk lain.",
+                      evaluasi="Uji A/B antar rak/toko selama 4-8 minggu; bandingkan attach rate & basket_size sebelum vs sesudah."))
+    R.append(dict(judul=f"Win-back pelanggan segmen {churn['segmen']}", skor=[5, 4, 3, 4],
+                  bukti=f"Fakta data: {churn['n']} pelanggan ({churn['pct']:.1f}%), rata-rata Recency {churn['R']:.0f} hari, Frequency {churn['F']:.1f}, Monetary {rp(churn['M'])}.",
+                  tindakan="Kirim voucher terbatas waktu & pesan personal, tawarkan produk yang biasa dibeli; ukur respons dalam 30 hari.",
+                  kpi="Reactivation rate, repeat purchase 30/60 hari, penurunan rata-rata Recency.",
+                  estimasi=f"Estimasi (asumsi): reaktivasi 10% = {churn['n'] * 0.1:.0f} pelanggan × belanja rata-rata segmen ≈ {rp(churn['n'] * 0.1 * churn['M'])} (batas atas, selama periode data).",
+                  asumsi="Reaktivasi 10%, pelanggan yang kembali berbelanja setara rata-rata segmen, biaya voucher ±5% dari nilai belanja.",
+                  evaluasi="Bandingkan kelompok yang diberi voucher vs kelompok kontrol (holdout) selama 60 hari."))
+    R.append(dict(judul=f"Program loyalitas untuk segmen {loyal['segmen']}", skor=[3, 5, 3, 4],
+                  bukti=f"Fakta data: {loyal['n']} pelanggan ({loyal['pct']:.1f}%) dengan Monetary rata-rata {rp(loyal['M'])} dan Frequency {loyal['F']:.1f}; segmen bernilai tertinggi.",
+                  tindakan="Poin loyalitas, akses awal promo, bundling premium; jaga agar frekuensi belanja tidak turun.",
+                  kpi="Retention rate, Customer Lifetime Value, kontribusi penjualan segmen.",
+                  estimasi=f"Estimasi (asumsi): kenaikan belanja 3% pada segmen ini ≈ {rp(loyal['n'] * loyal['M'] * 0.03)} per tahun.",
+                  asumsi="Kenaikan belanja 3% hanya dari program; tidak ada pelanggan berpindah segmen.",
+                  evaluasi="Pantau belanja segmen setiap bulan terhadap baseline periode sebelumnya."))
+    R.append(dict(judul=f"Dorong frekuensi segmen {pot['segmen']} dengan promo bundling", skor=[3, 4, 4, 4],
+                  bukti=f"Fakta data: {pot['n']} pelanggan ({pot['pct']:.1f}%), Frequency rata-rata {pot['F']:.1f}, Monetary {rp(pot['M'])}.",
+                  tindakan="Tawarkan paket dari aturan Apriori & diskon kelipatan belanja untuk menaikkan frekuensi.",
+                  kpi="Frequency per pelanggan, perpindahan segmen ke Loyal.",
+                  estimasi="Estimasi bergantung asumsi respons pelanggan; tentukan target setelah uji coba kecil.",
+                  asumsi="Pelanggan responsif terhadap bundling serupa pola yang ditemukan.",
+                  evaluasi="Uji coba 1 bulan pada sampel pelanggan, lihat perubahan Frequency."))
+    for r in R: r['total'] = sum(r['skor'])
+    R.sort(key=lambda r: -r['total'])
+    return dict(items=R, short=["Minggu 1-2: pasang bundling & atur rak untuk 3 pasangan produk teratas.", "Minggu 2-4: luncurkan voucher win-back ke segmen berisiko dengan kelompok kontrol.", "Bulan 2-3: evaluasi A/B (attach rate, reactivation rate) dan sesuaikan promo."],
+                mid=["Bulan 3-6: program loyalitas bertingkat untuk segmen bernilai tinggi.", "Bulan 4-6: perbarui RFM & K-Means tiap bulan, tambahkan pelacakan kategori.", "Bulan 6: tinjau ulang seluruh KPI dan perluas Apriori ke data multi-toko."],
+                kpis=["Total penjualan & jumlah transaksi", "Rata-rata basket_size", "Attach rate pasangan produk", "Reactivation rate segmen berisiko", "Retention rate segmen loyal", "Rata-rata Recency & Frequency"],
+                note="Bedakan: (1) FAKTA = angka yang dihitung langsung dari data; (2) ESTIMASI = proyeksi berbasis asumsi yang tertulis; (3) DAMPAK AKTUAL = baru diketahui setelah implementasi & uji.")
+
+
+def bu():
+    c, tx = S['clean'], S['tx']
+    m = tx.assign(M=tx.Date.dt.strftime('%Y-%m')).groupby('M').Net_Sales.sum()
+    ap = run_apriori(c, MS_DEF, MC_DEF, 1)
+    top = ap['rules'][0] if ap.get('rules') else None
+    best = max(S['prof'], key=lambda p: p['n'] * p['M'])
+    return dict(
+        masalah=["Data transaksi hanya dipakai untuk laporan rutin; pola pembelian belum dianalisis.",
+                 "Kombinasi produk yang sering dibeli bersama belum diketahui sehingga penempatan produk & promo belum berbasis data.",
+                 "Pelanggan belum dikelompokkan berdasarkan perilaku belanja, sehingga strategi pemasaran belum tepat sasaran.",
+                 "Data mentah memuat missing values, duplikat, nilai tidak wajar, dan format tidak konsisten."],
+        pertanyaan=[
+            dict(q="Produk apa yang sering dibeli bersama?", a=(f"Pasangan terkuat: {top['a']} → {top['c']} (lift {top['lift']:.2f}, confidence {top['confidence'] * 100:.1f}%)." if top else "Belum ada aturan pada ambang saat ini.")),
+            dict(q="Segmen pelanggan mana yang paling bernilai?", a=f"{best['segmen']}: {best['n']} pelanggan, total kontribusi ≈ {rp(best['n'] * best['M'])} (rata-rata {rp(best['M'])}/pelanggan)."),
+            dict(q="Kapan penjualan meningkat?", a=f"Puncak penjualan bersih pada bulan {m.idxmax()} ({rp(m.max())}); terendah {m.idxmin()} ({rp(m.min())})."),
+            dict(q="Pelanggan mana yang berisiko tidak kembali?", a=f"{S['prof'][-1]['segmen'] if False else max(S['prof'], key=lambda p: p['R'])['segmen']} - Recency rata-rata {max(p['R'] for p in S['prof']):.0f} hari.")],
+        manfaat="Hasil Apriori membantu bundling & penempatan rak untuk menaikkan nilai keranjang (penjualan); segmentasi K-Means membantu menjaga pelanggan bernilai tinggi dan menangani pelanggan berisiko pergi (retensi).")
+
+
+# ------------------------------------------------------------------ halaman
+CSS = """
+*{box-sizing:border-box}body{margin:0;font-family:'Segoe UI',Arial,sans-serif;background:#eef3fb;color:#0f2447}
+:root{--navy:#0b2a5b;--blue:#1f5fd1;--org:#f59e0b;--card:#fff}
+.btn{background:var(--navy);color:#fff;border:0;padding:10px 18px;border-radius:8px;cursor:pointer;font-weight:600}.btn:hover{background:var(--blue)}
+.btn.o{background:var(--org);color:#0b2a5b}input,select{padding:9px 10px;border:1px solid #c5d3ea;border-radius:8px;font-size:14px;width:100%}
+.cover{min-height:100vh;display:grid;grid-template-columns:1.2fr 1fr}
+.left{background:linear-gradient(150deg,#0b2a5b,#1f5fd1 70%,#f59e0b 130%);color:#fff;padding:48px;display:flex;flex-direction:column;justify-content:center;gap:14px}
+.left h1{font-size:44px;margin:0;line-height:1.1}.left h1 span{color:#fbbf24}.pill{display:inline-block;background:rgba(255,255,255,.15);padding:5px 12px;border-radius:20px;font-size:13px;margin-right:6px}
+.foto{width:150px;height:150px;border-radius:50%;object-fit:cover;border:5px solid #fbbf24;background:#fff;display:flex;align-items:center;justify-content:center;font-size:48px;font-weight:700;color:#0b2a5b}
+.id td{padding:3px 12px 3px 0;font-size:15px}.right{display:flex;align-items:center;justify-content:center;padding:30px}
+.box{background:#fff;border-radius:16px;padding:32px;width:100%;max-width:400px;box-shadow:0 10px 30px rgba(11,42,91,.15)}
+.box h2{margin-top:0}.box label{font-size:13px;font-weight:600;display:block;margin:12px 0 4px}.err{color:#c0262d;font-size:14px;margin-top:10px}
+.wrap{max-width:760px;margin:40px auto;padding:0 16px}.card{background:var(--card);border-radius:12px;padding:18px;box-shadow:0 2px 8px rgba(11,42,91,.08);margin-bottom:16px}
+.top{background:var(--navy);color:#fff;padding:10px 20px;display:flex;justify-content:space-between;align-items:center}
+.top a{color:#fbbf24;text-decoration:none;font-weight:600}
+.layout{display:grid;grid-template-columns:230px 1fr;min-height:calc(100vh - 48px)}
+.side{background:#fff;padding:14px 10px;border-right:1px solid #d7e2f5}.side button{display:block;width:100%;text-align:left;background:none;border:0;padding:11px 12px;border-radius:8px;cursor:pointer;font-size:14px;color:#0f2447;margin-bottom:3px}
+.side button.on,.side button:hover{background:#e3edff;color:var(--blue);font-weight:700}.main{padding:18px;overflow:hidden}
+.filters{display:flex;flex-wrap:wrap;gap:10px;align-items:end;margin-bottom:14px}.filters div{min-width:130px}.filters label{font-size:12px;font-weight:600;display:block;margin-bottom:3px}
+.chips{display:flex;flex-wrap:wrap;gap:4px;max-width:480px}.chips label{background:#fff;border:1px solid #c5d3ea;border-radius:16px;padding:3px 9px;font-weight:400;cursor:pointer;display:inline-flex;gap:4px;align-items:center}.chips input{width:auto}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:14px}.kpi{background:#fff;border-left:5px solid var(--org);border-radius:10px;padding:14px;box-shadow:0 2px 8px rgba(11,42,91,.08)}
+.kpi small{color:#52627f}.kpi b{display:block;font-size:22px;margin-top:4px}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px}h2.t{margin:4px 0 12px}h3{margin:0 0 8px;font-size:16px}
+table{border-collapse:collapse;width:100%;font-size:13px}th{background:#0b2a5b;color:#fff;text-align:left;padding:7px}td{padding:6px 7px;border-bottom:1px solid #e3eaf7}.sc{overflow-x:auto}
+.note{background:#fff7e6;border-left:4px solid var(--org);padding:10px 12px;border-radius:8px;font-size:14px;margin:8px 0}
+.tag{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;font-weight:600;background:#e3edff;color:#1f5fd1}canvas{max-height:320px}
+ul{margin:6px 0;padding-left:20px}li{margin:4px 0;line-height:1.45}.hm td{text-align:center;font-size:11px;padding:5px;border:1px solid #fff}
+@media(max-width:800px){.cover,.layout{grid-template-columns:1fr}}
+"""
+
+
+def cover_html(err=""):
+    fo = '<img class="foto" src="/foto?%d">' % int(os.path.getmtime(foto_file())) if foto_file() else '<div class="foto">%s</div>' % "".join(w[0] for w in NAMA.split()[:2])
+    return f"""<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>UTS Business Intelligence</title><style>{CSS}</style></head><body>
+<div class="cover"><div class="left">{fo}
+<div><span class="pill">UJIAN TENGAH SEMESTER</span><span class="pill">{KODE}</span></div>
+<h1>Business <span>Intelligence</span><br>Dashboard</h1>
+<div style="font-size:17px;opacity:.95">Integrasi Data Mining &amp; Business Intelligence pada Data Transaksi Toko</div>
+<table class="id"><tr><td>Nama</td><td><b>: {NAMA}</b></td></tr><tr><td>NPM</td><td><b>: {NPM}</b></td></tr><tr><td>Universitas</td><td><b>: {UNIV}</b></td></tr>
+<tr><td>Program Studi</td><td>: {PRODI}</td></tr><tr><td>Semester</td><td>: {SEM}</td></tr><tr><td>Dosen</td><td>: {DOSEN}</td></tr></table>
+<div style="font-size:13px;opacity:.85">EDA · Preprocessing · Apriori · K-Means · Dashboard BI</div></div>
+<div class="right"><form class="box" method="post" action="/login" enctype="multipart/form-data"><h2>Masuk</h2>
+<label>Username</label><input name="u" required autofocus><label>Kata sandi</label><input name="p" type="password" required>
+<label>Foto cover (opsional)</label><input type="file" name="foto" accept="image/*"><div class="err">{err}</div><br><button class="btn" style="width:100%">Masuk →</button></form></div></div></body></html>"""
+
+
+def shell(body, extra_top=""):
+    return f"""<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>UTS BI</title><style>{CSS}</style></head><body>
+<div class="top"><b>📊 UTS Business Intelligence · {NAMA} ({NPM}) · {UNIV}</b><span>{extra_top}<a href="/logout">Keluar</a></span></div>{body}</body></html>"""
+
+
+def upload_html(msg=""):
+    st = f'<div class="note">File aktif: <b>{S.get("fname")}</b> ({S["raw_n"]:,} baris mentah). <a href="/app">Buka dashboard →</a></div>'.replace(',', '.') if S.get('clean') is not None else ""
+    return shell(f"""<div class="wrap"><div class="card"><h2>Unggah File Data</h2>
+<p>Unggah file Excel <b>P8__UTS_Business_Intelligence.xlsx</b> (berisi sheet <i>Data_Raw</i>, <i>Data_Produk</i>, <i>Data_Pelanggan</i>). Analisis baru berjalan setelah file diunggah.</p>{st}
+<form method="post" action="/upload" enctype="multipart/form-data" onsubmit="document.getElementById('b').textContent='Memproses... mohon tunggu'">
+<input type="file" name="f" accept=".xlsx,.xlsm" required><div class="err">{msg}</div><br><button id="b" class="btn o">Unggah &amp; Analisis</button></form></div></div>""")
+
+
+APP = """<div class="layout"><div class="side">
+<button data-p="dash" class="on">📈 Dashboard BI</button><button data-p="bu">1. Business Understanding</button><button data-p="eda">2. EDA &amp; Kualitas Data</button>
+<button data-p="prep">3. Preprocessing</button><button data-p="apr">4. Apriori</button><button data-p="km">5. K-Means</button><button data-p="bonus">6. Bonus Apriori × Segmen</button><button data-p="rek">7. Rekomendasi</button>
+<hr><a href="/upload" style="font-size:13px;padding:8px 12px;display:block;color:#1f5fd1">⬆ Ganti file</a></div>
+<div class="main"><div id="fbar" class="filters card" style="display:none">
+<div><label>Dari tanggal</label><input type="date" id="fs"></div><div><label>Sampai tanggal</label><input type="date" id="fe"></div>
+<div><label>Segmen pelanggan</label><select id="fseg"></select></div><div><label>Kategori</label><div class="chips" id="fcat"></div></div>
+<div><button class="btn" onclick="reload()">Terapkan</button> <button class="btn o" onclick="resetF()">Reset</button></div></div>
+<div id="view"></div></div></div>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+const $=id=>document.getElementById(id),N=v=>v==null?'-':Number(v).toLocaleString('id-ID',{maximumFractionDigits:0}),D=(v,d=2)=>v==null?'-':Number(v).toLocaleString('id-ID',{maximumFractionDigits:d}),RP=v=>'Rp '+N(v);
+const COL=['#1f5fd1','#f59e0b','#10b981','#ef4444','#8b5cf6','#06b6d4','#ec4899','#84cc16'];let CH={},META={},PAGE='dash',KM=null;
+function ch(id,cfg){if(CH[id])CH[id].destroy();CH[id]=new Chart($(id),cfg)}
+function tbl(h,rows){return '<div class="sc"><table><tr>'+h.map(x=>'<th>'+x+'</th>').join('')+'</tr>'+rows.map(r=>'<tr>'+r.map(x=>'<td>'+x+'</td>').join('')+'</tr>').join('')+'</table></div>'}
+function kpi(l,v){return '<div class="kpi"><small>'+l+'</small><b>'+v+'</b></div>'}
+function card(t,b){return '<div class="card"><h3>'+t+'</h3>'+b+'</div>'}
+function cv(id){return '<canvas id="'+id+'"></canvas>'}
+function qs(){let c=[...document.querySelectorAll('#fcat input:checked')].map(x=>x.value).join('|');return 'start='+$('fs').value+'&end='+$('fe').value+'&seg='+encodeURIComponent($('fseg').value)+'&cats='+encodeURIComponent(c)}
+async function J(u){const r=await fetch(u);return r.json()}
+function bar(id,l,d,lab,horiz,color){ch(id,{type:'bar',data:{labels:l,datasets:[{label:lab,data:d,backgroundColor:color||COL[0]}]},options:{indexAxis:horiz?'y':'x',plugins:{legend:{display:false}}}})}
+async function init(){META=await J('/api/meta');$('fs').value=META.date_min;$('fe').value=META.date_max;$('fseg').innerHTML='<option>Semua</option>'+META.segs.map(s=>'<option>'+s+'</option>').join('');
+$('fcat').innerHTML=META.cats.map(c=>'<label><input type="checkbox" value="'+c+'">'+c+'</label>').join('');
+document.querySelectorAll('.side button').forEach(b=>b.onclick=()=>{document.querySelectorAll('.side button').forEach(x=>x.classList.remove('on'));b.classList.add('on');PAGE=b.dataset.p;reload()});reload()}
+function resetF(){$('fs').value=META.date_min;$('fe').value=META.date_max;$('fseg').value='Semua';document.querySelectorAll('#fcat input').forEach(x=>x.checked=false);reload()}
+async function reload(){$('fbar').style.display=(PAGE=='dash'||PAGE=='apr')?'flex':'none';$('view').innerHTML='<div class="card">Memuat...</div>';await ({dash,bu,eda,prep,apr,km,bonus,rek})[PAGE]()}
+async function metaRefresh(){META=await J('/api/meta');$('fseg').innerHTML='<option>Semua</option>'+META.segs.map(s=>'<option>'+s+'</option>').join('')}
+
+async function dash(){const d=await J('/api/dash?'+qs());if(!d.kpi.txn){$('view').innerHTML='<div class="note">Tidak ada data untuk filter ini.</div>';return}
+$('view').innerHTML='<h2 class="t">Dashboard Business Intelligence</h2><div class="kpis">'+kpi('Total Penjualan Bersih',RP(d.kpi.sales))+kpi('Jumlah Transaksi',N(d.kpi.txn))+kpi('Pelanggan Unik',N(d.kpi.cust))+kpi('Rata-rata basket_size',D(d.kpi.basket))+kpi('Rata-rata Nilai Transaksi',RP(d.kpi.avgtx))+'</div>'+
+'<div class="grid2">'+card('Tren Penjualan Bulanan',cv('c1'))+card('Top 10 Produk (Penjualan)',cv('c2'))+card('Distribusi Penjualan per Kategori',cv('c3'))+card('Penjualan per Wilayah',cv('c4'))+card('Jumlah Pelanggan per Segmen (K-Means)',cv('c5'))+card('Aturan Asosiasi Teratas (filter ini)','<div id="ar"></div>')+'</div>'+
+'<div class="note"><b>Cara baca:</b> tren menunjukkan bulan puncak/terendah; Top 10 produk untuk prioritas stok; distribusi kategori untuk kontribusi tiap kelompok; segmen menunjukkan komposisi pelanggan; aturan Apriori untuk bundling. Gunakan filter di atas untuk mempersempit periode, kategori atau segmen.</div>';
+ch('c1',{type:'line',data:{labels:d.trend[0],datasets:[{label:'Penjualan',data:d.trend[1],borderColor:COL[0],backgroundColor:'#1f5fd122',fill:true,tension:.3}]},options:{plugins:{legend:{display:false}}}});
+bar('c2',d.top[0],d.top[1],'Penjualan',true,COL[1]);ch('c3',{type:'doughnut',data:{labels:d.cat[0],datasets:[{data:d.cat[1],backgroundColor:COL.concat(COL)}]},options:{plugins:{legend:{position:'right'}}}});
+bar('c4',d.reg[0],d.reg[1],'Penjualan',false,COL[2]);bar('c5',d.seg[0],d.seg[1],'Pelanggan',false,COL[4]);
+$('ar').innerHTML=d.rules.length?tbl(['Aturan','Support','Conf.','Lift'],d.rules.map(r=>[r.a+' → '+r.c,D(r.support*100)+'%',D(r.confidence*100,1)+'%',D(r.lift)])):'Tidak ada aturan pada filter ini (data terlalu sedikit untuk ambang support).'}
+
+async function bu(){const d=await J('/api/bu');$('view').innerHTML='<h2 class="t">Tahap 1 - Business Understanding</h2>'+card('Permasalahan Utama','<ul>'+d.masalah.map(x=>'<li>'+x+'</li>').join('')+'</ul>')+card('Pertanyaan Bisnis &amp; Jawaban dari Data',tbl(['Pertanyaan','Jawaban berbasis data'],d.pertanyaan.map(x=>[x.q,x.a])))+card('Manfaat bagi Manajemen','<p>'+d.manfaat+'</p>')}
+
+async function eda(){const d=await J('/api/eda');$('view').innerHTML='<h2 class="t">Tahap 1 - EDA &amp; Kualitas Data (Data_Raw)</h2><div class="kpis">'+kpi('Baris × Kolom',N(d.rows)+' × '+d.cols)+kpi('Rentang Tanggal',d.date_min+' s/d '+d.date_max)+kpi('Transaksi Unik',N(d.n_txn))+kpi('Pelanggan Unik',N(d.n_cust))+kpi('Produk Unik',N(d.n_prod))+kpi('Total Penjualan Sementara',RP(d.sales))+kpi('Rata-rata Quantity (valid)',D(d.avg_qty))+'</div>'+
+card('Tipe Data &amp; Missing Values',tbl(['Kolom','Tipe','Kosong'],d.dtypes.map(x=>[x[0],x[1],N(x[2])])))+card('Masalah Kualitas Data',tbl(['Pemeriksaan','Jumlah'],[['Sel kosong (total)',N(d.missing)],['Baris duplikat persis',N(d.dups)],['Quantity tidak valid (≤0 / &gt;50)',N(d.bad_qty)],['Unit_Price tidak wajar (≤0 / &gt;3× harga referensi)',N(d.bad_price)],['Line_Total ≠ Qty×Harga×(1−Diskon)',N(d.bad_lt)],['Kategori tidak konsisten (ejaan)',N(d.inc_cat)],['Payment_Method tidak konsisten',N(d.inc_pay)]]))+
+'<div class="grid2">'+card('Tren Penjualan Bulanan (mentah)',cv('e1'))+card('Top 10 Produk (mentah)',cv('e2'))+card('Sebaran Quantity (outlier terlihat)',cv('e3'))+card('Missing Values per Kolom',cv('e4'))+'</div>'+card('Temuan Awal','<ul>'+d.insights.map(x=>'<li>'+x+'</li>').join('')+'</ul>');
+ch('e1',{type:'line',data:{labels:d.charts.monthly[0],datasets:[{label:'Rp',data:d.charts.monthly[1],borderColor:COL[0],tension:.3}]},options:{plugins:{legend:{display:false}}}});bar('e2',d.charts.top[0],d.charts.top[1],'Rp',true,COL[1]);bar('e3',d.charts.qty[0],d.charts.qty[1],'Baris',false,COL[3]);bar('e4',d.charts.miss[0],d.charts.miss[1],'Kosong',false,COL[4])}
+
+async function prep(){const d=await J('/api/prep'),b=d.ba.before,a=d.ba.after,f=(k)=>[k[0],N(b[k[1]]),N(a[k[1]])];
+$('view').innerHTML='<h2 class="t">Tahap 2 - Preprocessing &amp; Feature Engineering</h2>'+card('Log Keputusan Preprocessing (Data_Raw tidak ditimpa, memakai salinan)',tbl(['Masalah','Jumlah','Keputusan','Alasan'],d.log.map(x=>[x.masalah,N(x.jumlah),x.keputusan,x.alasan])))+
+card('Perbandingan Sebelum vs Sesudah',tbl(['Indikator','Sebelum','Sesudah'],[f(['Jumlah baris','rows']),f(['Transaksi unik','n_txn']),f(['Pelanggan unik','n_cust']),f(['Produk unik','n_prod']),f(['Sel kosong','missing']),f(['Baris duplikat','dups']),f(['Quantity tidak valid','bad_qty']),f(['Unit_Price tidak wajar','bad_price']),['Total penjualan',RP(b.sales),RP(a.sales)]]))+
+card('Feature Engineering','<ul><li><b>basket_size</b> = jumlah produk unik per Transaction_ID (rata-rata '+D(d.avg_basket)+').</li><li><b>RFM</b>: tanggal acuan <b>'+d.ref+'</b> (1 hari setelah transaksi terakhir). Recency = hari sejak transaksi terakhir; Frequency = jumlah transaksi unik; Monetary = total Net_Sales. Jumlah pelanggan: <b>'+N(d.n_rfm)+'</b>.</li><li><b>Matriks Apriori</b>: '+N(d.n_txn)+' transaksi × '+d.n_items+' produk (1 = dibeli).</li><li><b>Standardisasi (Z-score)</b> pada R, F, M sebelum K-Means: skala Monetary (jutaan rupiah) jauh lebih besar dari Frequency, sehingga tanpa scaling jarak Euclidean didominasi Monetary.</li><li><b>Data besar</b>: gunakan chunking saat membaca file, agregasi ke level transaksi/pelanggan (seperti di sini), atau sampling acak terstratifikasi bila data jutaan baris.</li><li><b>Ringkasan:</b> dipertahankan '+N(a.rows)+' dari '+N(b.rows)+' baris; dihapus '+N(b.rows-a.rows)+'; nilai diubah/diimputasi lihat log di atas.</li></ul>')+
+card('Unduh Hasil','<a class="btn" href="/download/clean.csv">Data_Clean.csv</a> <a class="btn" href="/download/rfm.csv">RFM_Pelanggan.csv</a> <a class="btn" href="/download/basket.csv">Transaksi_Basket.csv</a>')+card('Contoh RFM (10 baris)',tbl(['Customer_ID','Recency','Frequency','Monetary'],d.rfm_head.map(x=>[x[0],x[1],x[2],RP(x[3])])))}
+
+async function apr(){const ms=$('ms')?$('ms').value:'0.01',mc=$('mc')?$('mc').value:'0.15';const d=await J('/api/apriori?'+qs()+'&ms='+ms+'&mc='+mc);
+let h='<h2 class="t">Tahap 3 - Market Basket Analysis (Apriori)</h2>'+card('Parameter','<div class="grid2"><div><label>Minimum support</label><input id="ms" value="'+ms+'"></div><div><label>Minimum confidence</label><input id="mc" value="'+mc+'"></div></div><br><button class="btn" onclick="apr()">Jalankan Ulang</button><div class="note">Support 1% (±60 transaksi dari 6.000) dipilih karena rata-rata hanya ±3 produk/basket dari 30 produk, sehingga pasangan produk umumnya bersupport &lt;1%; ambang lebih tinggi menyisakan terlalu sedikit aturan. Confidence 15% memastikan aturan cukup andal. Aturan diurutkan menurut <b>lift</b> (lalu confidence, support) karena lift &gt; 1 berarti kedua produk dibeli bersama lebih sering dari kebetulan.</div>');
+if(!d.ok){$('view').innerHTML=h+'<div class="note">'+d.msg+'</div>';return}
+h+='<div class="kpis">'+kpi('Transaksi dianalisis',N(d.n_txn))+kpi('Produk',d.n_items)+kpi('Frequent itemset',Object.entries(d.sizes).map(e=>e[0]+'-item: '+e[1]).join(', '))+kpi('Aturan (conf ≥ min)',N(d.n_rules))+kpi('Aturan lift > 1',N(d.n_good))+'</div>';
+h+=card('Top 10 Aturan Asosiasi',d.rules.length?tbl(['#','Jika membeli (antecedent)','Maka membeli (consequent)','Support','Confidence','Lift'],d.rules.map((r,i)=>[i+1,r.a,r.c,D(r.support*100)+'%',D(r.confidence*100,1)+'%',D(r.lift)])):'Tidak ada aturan memenuhi ambang.');
+h+='<div class="grid2">'+card('Network Graph Aturan (tebal garis = lift)','<svg id="net" viewBox="0 0 560 440" style="width:100%"></svg>')+card('Heatmap Lift 12 Produk Terlaris','<div class="sc" id="hm"></div>')+'</div>';
+if(d.rules.length){const r=d.rules[0];h+='<div class="note"><b>Interpretasi aturan teratas:</b> '+r.a+' → '+r.c+'. Support '+D(r.support*100)+'% = porsi transaksi yang memuat keduanya; confidence '+D(r.confidence*100,1)+'% = dari transaksi yang memuat '+r.a+', segitu juga memuat '+r.c+'; lift '+D(r.lift)+' = peluang dibeli bersama '+D(r.lift)+'× lebih besar dari kebetulan. Ini korelasi, bukan sebab-akibat.</div>'+card('Rekomendasi Cross-selling / Bundling &amp; Penempatan Rak','<ul>'+d.rules.slice(0,5).map(r=>'<li>Letakkan <b>'+r.a+'</b> dan <b>'+r.c+'</b> berdekatan &amp; tawarkan paket bundling (lift '+D(r.lift)+', confidence '+D(r.confidence*100,1)+'%).</li>').join('')+'</ul>')}
+$('view').innerHTML=h;
+const ns=[...new Set(d.rules.flatMap(r=>[r.a,r.c]))].slice(0,14),cx=280,cy=220,R=165,P={};ns.forEach((n,i)=>{const t=2*Math.PI*i/ns.length;P[n]=[cx+R*Math.cos(t),cy+R*Math.sin(t)]});
+let s='<defs><marker id="ar" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#f59e0b"/></marker></defs>';
+d.rules.forEach(r=>{if(P[r.a]&&P[r.c])s+='<line x1="'+P[r.a][0]+'" y1="'+P[r.a][1]+'" x2="'+P[r.c][0]+'" y2="'+P[r.c][1]+'" stroke="#f59e0b" stroke-width="'+Math.max(1,r.lift*1.2)+'" opacity=".75" marker-end="url(#ar)"/>'});
+ns.forEach(n=>{s+='<circle cx="'+P[n][0]+'" cy="'+P[n][1]+'" r="6" fill="#1f5fd1"/><text x="'+P[n][0]+'" y="'+(P[n][1]+(P[n][1]>cy?18:-10))+'" font-size="10" text-anchor="middle" fill="#0f2447">'+n+'</text>'});$('net').innerHTML=s;
+const it=d.heat.items;let t='<table class="hm"><tr><td></td>'+it.map(x=>'<td><b>'+x.slice(0,9)+'</b></td>').join('')+'</tr>';
+d.heat.m.forEach((row,i)=>{t+='<tr><td><b>'+it[i].slice(0,12)+'</b></td>'+row.map(v=>{if(v==null)return '<td style="background:#eee">-</td>';const a=Math.min(1,Math.max(0,(v-0.7)/2.5));return '<td style="background:rgba(31,95,209,'+(0.08+a*.85)+');color:'+(a>.5?'#fff':'#0f2447')+'">'+D(v)+'</td>'}).join('')+'</tr>'});$('hm').innerHTML=t+'</table>'}
+
+async function km(k){const d=await J('/api/kmeans'+(k?'?k='+k:''));KM=d;await metaRefresh();
+$('view').innerHTML='<h2 class="t">Tahap 4 - Segmentasi Pelanggan (K-Means)</h2>'+card('Fitur &amp; Pemilihan k','<p>Fitur: <b>Recency, Frequency, Monetary</b> (1 baris = 1 pelanggan, Customer_ID tidak dipakai sebagai fitur), distandardisasi Z-score. Kandidat k = 2-8 dievaluasi dengan Elbow &amp; Silhouette. k dipilih = <b>3</b>: silhouette tertinggi pada k ≥ 3 (k = 2 hanya membagi pelanggan jadi dua kelompok kasar sehingga kurang berguna bagi strategi pemasaran), dan elbow mulai melandai di k = 3.</p><div class="grid2" style="margin-top:8px"><div><label>Jumlah klaster (k) yang ditampilkan</label><select id="kk" onchange="km(this.value)">'+[2,3,4,5,6,7,8].map(x=>'<option '+(x==d.k?'selected':'')+'>'+x+'</option>').join('')+'</select></div></div>')+
+'<div class="grid2">'+card('Elbow Method (Inertia)',cv('k1'))+card('Silhouette Score',cv('k2'))+'</div>'+card('Nilai Evaluasi',tbl(['k','Inertia','Silhouette'],d.eval.map(e=>[e.k,N(e.inertia),D(e.sil,3)])))+
+card('Profil Segmen (rata-rata / median)',tbl(['Segmen','Klaster','Pelanggan','%','Recency (hari)','Frequency','Monetary','Median R/F/M','Strategi'],d.profil.map(p=>['<span class="tag">'+p.segmen+'</span>',p.cluster,N(p.n),D(p.pct,1)+'%',D(p.R,0),D(p.F,1),RP(p.M),N(p.Rm)+' / '+N(p.Fm)+' / '+RP(p.Mm),p.strategi])))+
+'<div class="grid2">'+card('Jumlah Pelanggan per Klaster',cv('k3'))+card('Scatter Plot Klaster','<div style="display:flex;gap:8px;margin-bottom:6px"><select id="sx" onchange="scat()"><option value="0">X: Recency</option><option value="1" selected>X: Frequency</option><option value="2">X: Monetary</option></select><select id="sy" onchange="scat()"><option value="0">Y: Recency</option><option value="1">Y: Frequency</option><option value="2" selected>Y: Monetary</option></select></div>'+cv('k4'))+'</div>'+
+card('Segmen Prioritas','<p>'+(()=>{const p=d.profil.find(x=>x.segmen.includes('Churn')||x.segmen.includes('At Risk'))||d.profil[d.profil.length-1],l=d.profil[0];return 'Prioritas 1: <b>'+l.segmen+'</b> (nilai belanja tertinggi, '+RP(l.M)+'/pelanggan) - dipertahankan. Prioritas 2: <b>'+p.segmen+'</b> (Recency '+D(p.R,0)+' hari) - dicegah agar tidak hilang.'})()+'</p>');
+ch('k1',{type:'line',data:{labels:d.eval.map(e=>e.k),datasets:[{label:'Inertia',data:d.eval.map(e=>e.inertia),borderColor:COL[0],tension:.2}]}});ch('k2',{type:'line',data:{labels:d.eval.map(e=>e.k),datasets:[{label:'Silhouette',data:d.eval.map(e=>e.sil),borderColor:COL[1],tension:.2}]}});
+bar('k3',d.profil.map(p=>p.segmen),d.profil.map(p=>p.n),'Pelanggan',false,COL[4]);scat()}
+function scat(){const d=KM,x=+$('sx').value,y=+$('sy').value,nm=['Recency','Frequency','Monetary'];
+ch('k4',{type:'scatter',data:{datasets:d.order.map((s,i)=>({label:s,data:d.points.filter(p=>p[3]==i).map(p=>({x:p[x],y:p[y]})),backgroundColor:COL[i%8]+'99',pointRadius:3}))},options:{scales:{x:{title:{display:true,text:nm[x]}},y:{title:{display:true,text:nm[y]}}}}})}
+
+async function bonus(){const d=await J('/api/bonus');$('view').innerHTML='<h2 class="t">Bonus - Apriori × Segmen K-Means</h2><div class="note">Aturan Apriori dihitung terpisah pada transaksi tiap segmen (support minimum 2% karena jumlah transaksi per segmen lebih kecil). Indeks produk = porsi transaksi segmen yang membeli produk ÷ porsi pada seluruh pelanggan (&gt;1 = lebih khas untuk segmen).</div>'+d.map(s=>card('<span class="tag">'+s.segmen+'</span> · '+N(s.n_txn)+' transaksi',(s.rules.length?tbl(['Aturan','Support','Confidence','Lift'],s.rules.map(r=>[r.a+' → '+r.c,D(r.support*100)+'%',D(r.confidence*100,1)+'%',D(r.lift)])):'Tidak ada aturan lolos ambang.')+'<br>'+tbl(['Produk khas segmen','Penetrasi','Indeks'],s.prod.map(p=>[p[0],D(p[1]*100,1)+'%',D(p[2])])))).join('')}
+
+async function rek(){const d=await J('/api/rekom');$('view').innerHTML='<h2 class="t">Tahap 5 - Rekomendasi Keputusan Bisnis</h2><div class="note">'+d.note+'</div>'+card('Prioritas Tindakan (skor 1-5: urgensi, potensi manfaat, kemudahan biaya, kemudahan penerapan)',tbl(['#','Rekomendasi','Urgensi','Manfaat','Biaya','Kemudahan','Total'],d.items.map((r,i)=>[i+1,r.judul].concat(r.skor).concat(['<b>'+r.total+'</b>']))))+
+d.items.map((r,i)=>card((i+1)+'. '+r.judul,'<ul><li><b>Bukti data:</b> '+r.bukti+'</li><li><b>Tindakan:</b> '+r.tindakan+'</li><li><b>KPI:</b> '+r.kpi+'</li><li><b>Estimasi biaya/manfaat:</b> '+r.estimasi+'</li><li><b>Asumsi:</b> '+r.asumsi+'</li><li><b>Evaluasi dampak:</b> '+r.evaluasi+'</li></ul>')).join('')+
+'<div class="grid2">'+card('Rencana Jangka Pendek','<ul>'+d.short.map(x=>'<li>'+x+'</li>').join('')+'</ul>')+card('Rencana Jangka Menengah','<ul>'+d.mid.map(x=>'<li>'+x+'</li>').join('')+'</ul>')+'</div>'+card('KPI Evaluasi','<ul>'+d.kpis.map(x=>'<li>'+x+'</li>').join('')+'</ul>')}
+init();
+</script>"""
+
+
+# ------------------------------------------------------------------ routes
+def logged(): return session.get('ok')
+
+
+@app.route('/')
+def index(): return redirect('/upload' if logged() else '/login')
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        f = request.files.get('foto')
+        if f and f.filename and f.filename.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+            for old in glob.glob(os.path.join(BASE, 'foto_profil*')): os.remove(old)
+            f.save(os.path.join(BASE, 'foto_profil' + os.path.splitext(f.filename)[1].lower()))
+        if request.form.get('u', '').strip().lower() == USER and request.form.get('p') == PWD:
+            session['ok'] = True
+            return redirect('/upload')
+        return cover_html("Username atau kata sandi salah.")
+    return cover_html()
+
+
+@app.route('/logout')
+def logout():
+    session.clear(); return redirect('/login')
+
+
+@app.route('/foto')
+def foto():
+    f = foto_file()
+    return send_file(f) if f else ("", 404)
+
+
+@app.route('/upload', methods=['GET', 'POST'])
+def upload():
+    if not logged(): return redirect('/login')
+    if request.method == 'POST':
+        f = request.files.get('f')
+        try:
+            raw, prod, cust = load(io.BytesIO(f.read()))
+            S.clear()
+            S['fname'], S['raw_n'] = f.filename, len(raw)
+            S['audit'] = audit(raw, prod)
+            clean, log, ba = preprocess(raw, prod, cust)
+            S['clean'], S['log'], S['ba'] = clean, log, ba
+            S['tx'], S['rfm'], S['ref'] = build(clean)
+            S['Z'], S['ev'] = km_eval(S['rfm'])
+            km_fit(K_DEF)
+        except Exception as e:
+            S.clear()
+            return upload_html(f"Gagal memproses file: {e}")
+        return redirect('/app')
+    return upload_html()
+
+
+@app.route('/app')
+def dashboard():
+    if not logged(): return redirect('/login')
+    if S.get('clean') is None: return redirect('/upload')
+    return shell(APP, f"<span style='margin-right:14px;font-size:13px'>File: {S['fname']}</span>")
+
+
+def guard():
+    return logged() and S.get('clean') is not None
+
+
+@app.route('/api/meta')
+def a_meta():
+    if not guard(): return api({})
+    c = S['clean']
+    return api(dict(date_min=str(c.Date.min())[:10], date_max=str(c.Date.max())[:10], cats=sorted(c.Category.unique()), segs=sorted(S['seg'].unique())))
+
+
+@app.route('/api/dash')
+def a_dash():
+    if not guard(): return api({})
+    c = filt(request.args)
+    if c.empty: return api(dict(kpi=dict(txn=0)))
+    tx = c.groupby('Transaction_ID').agg(s=('Net_Sales', 'sum'), b=('Product_ID', 'nunique'))
+    tr = c.groupby('Month').Net_Sales.sum()
+    tp = c.groupby('Product_Name').Net_Sales.sum().nlargest(10)
+    ct = c.groupby('Category').Net_Sales.sum().sort_values(ascending=False)
+    rg = c.groupby('Region').Net_Sales.sum().sort_values(ascending=False)
+    sg = S['seg'][S['seg'].index.isin(c.Customer_ID.unique())].value_counts()
+    ap = run_apriori(c, MS_DEF, MC_DEF, 5)
+    return api(dict(kpi=dict(sales=c.Net_Sales.sum(), txn=len(tx), cust=c.Customer_ID.nunique(), basket=tx.b.mean(), avgtx=tx.s.mean()),
+                    trend=[list(tr.index), list(tr.values)], top=[list(tp.index), list(tp.values)], cat=[list(ct.index), list(ct.values)],
+                    reg=[list(rg.index), list(rg.values)], seg=[list(sg.index), list(sg.values)], rules=ap.get('rules', []) if ap.get('ok') else []))
+
+
+@app.route('/api/bu')
+def a_bu(): return api(bu()) if guard() else api({})
+
+
+@app.route('/api/eda')
+def a_eda(): return api(S['audit']) if guard() else api({})
+
+
+@app.route('/api/prep')
+def a_prep():
+    if not guard(): return api({})
+    r = S['rfm']
+    return api(dict(log=S['log'], ba=S['ba'], ref=str(S['ref'])[:10], n_rfm=len(r), avg_basket=S['tx'].basket_size.mean(), n_txn=len(S['tx']),
+                    n_items=S['clean'].Product_Name.nunique(), rfm_head=r.head(10).values.tolist()))
+
+
+@app.route('/api/apriori')
+def a_apriori():
+    if not guard(): return api({})
+    return api(run_apriori(filt(request.args), float(request.args.get('ms', MS_DEF)), float(request.args.get('mc', MC_DEF)), 10))
+
+
+@app.route('/api/kmeans')
+def a_km():
+    if not guard(): return api({})
+    return api(km_fit(int(request.args.get('k', S['k']))))
+
+
+@app.route('/api/bonus')
+def a_bonus():
+    if not guard(): return api([])
+    c, out = S['clean'], []
+    allp = c.groupby('Product_Name').Transaction_ID.nunique() / c.Transaction_ID.nunique()
+    for seg in S['prof']:
+        sub = c[c.Customer_ID.isin(S['seg'][S['seg'] == seg['segmen']].index)]
+        ap = run_apriori(sub, 0.02, 0.2, 3)
+        pen = sub.groupby('Product_Name').Transaction_ID.nunique() / sub.Transaction_ID.nunique()
+        top = (pen / allp).reindex(pen.index).sort_values(ascending=False).head(5)
+        out.append(dict(segmen=seg['segmen'], n_txn=sub.Transaction_ID.nunique(), rules=ap.get('rules', []) if ap.get('ok') else [],
+                        prod=[[p, float(pen[p]), float(top[p])] for p in top.index]))
+    return api(out)
+
+
+@app.route('/api/rekom')
+def a_rek(): return api(rekom()) if guard() else api({})
+
+
+@app.route('/download/<n>')
+def dl(n):
+    if not guard(): return redirect('/login')
+    df = {'clean.csv': S['clean'], 'rfm.csv': S['rfm'].assign(Segmen=S['rfm'].Customer_ID.map(S['seg'])), 'basket.csv': S['tx']}.get(n)
+    if df is None: return ("", 404)
+    return Response(df.to_csv(index=False), mimetype='text/csv', headers={'Content-Disposition': f'attachment; filename={n}'})
+
+
+if __name__ == '__main__':
+    print("Buka http://127.0.0.1:5000  |  login: febriana / 51230136")
+    app.run(debug=False, port=5000)
